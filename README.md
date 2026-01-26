@@ -15,6 +15,9 @@ This app does not require any external services beyond Google and EVS, and all c
    - `TELEGRAM_ALLOWED_UPDATES` optional JSON list of Telegram update types
    - `TELEGRAM_AUTO_WEBHOOK` optional true to auto set webhook in `entryPoint`
    - `TELEGRAM_UPGRADE_CODE*` optional premium codes, use suffixes for multiple codes
+   - `TELEGRAM_UPGRADE_CODE_AUTO_GRANT` optional label for auto‑grant upgrades
+   - `AUTO_GRANT_PREMIUM` optional `1` to enable auto‑grant premium
+   - `AUTO_GRANT_MAX` optional max number of auto‑grant premium licenses
    - `EVS_CARBON_KG_PER_KWH` optional carbon factor for leaderboard calculations
    - `EVS_TEST_USERNAME` optional test username used by `entryPoint`
    - `EVS_TEST_PASSWORD` optional test password used by `entryPoint`
@@ -31,14 +34,17 @@ This app does not require any external services beyond Google and EVS, and all c
 ## Commands
 - `/login` prompts for EVS username and password
 - `/status` meter info, balance, usage, projections
-- `/balance` balance only
-- `/usage` month to date usage
+- `/balance` alias for `/status`
+- `/usage` alias for `/status`
 - `/myinfo` meter details and location
 - `/history [days]` daily usage history
 - `/leaderboard` recent usage rank snapshots
 - `/data [days]` premium only balance log view
 - `/notify` premium only notification settings
 - `/upgrade <code>` unlock premium features
+- `/join_waitlist` join premium waitlist
+- `/leave_waitlist` leave premium waitlist
+- `/suggest <text>` send feedback to the suggestions sheet
 - `/logout` unlink EVS account
 - `/help` list commands
 
@@ -46,8 +52,24 @@ This app does not require any external services beyond Google and EVS, and all c
 - Credentials are stored in the `users` sheet. Keep the sheet private.
 - Logs are stored in the `logs` sheet.
 - Premium balance logs are stored in `account_balances` and upserted once per SGT day.
+- Suggestions are stored in the `suggestions` sheet.
+- Usage history values are currently fetched with `convert_to_money: "true"` (currency, not kWh).
 - EVS2 endpoints are used by default with a fallback to EVS1 credit balance where needed.
 - See `EVS_API.md` for endpoint details and payload shapes.
+
+## Auto‑Grant Premium
+Optional auto‑grant can give free premium access to the first N users who message the bot.
+- Enable with `AUTO_GRANT_PREMIUM=1`
+- Cap with `AUTO_GRANT_MAX`
+- Optional label with `TELEGRAM_UPGRADE_CODE_AUTO_GRANT`
+
+When auto‑grant triggers, the user is notified with their license number out of the total cap.
+
+## API Notes
+Newer endpoints used in the bot:
+- `get_month_to_date_usage` (usage)
+- `get_history` (daily history + runout projections)
+- `cp/get_recent_usage_stat` (leaderboard + rank snapshots)
 
 ## Architecture
 High level components and the main integration points between Telegram, Apps Script, Sheets, and EVS services.

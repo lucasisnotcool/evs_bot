@@ -68,6 +68,10 @@ function doPost(e) {
       upsertTelegramUser_(chatId, message.from);
       user = getUser_(chatId);
     }
+    if (shouldAutoGrantPremium_(user)) {
+      grantPremiumToUser_(chatId, user);
+      user = getUser_(chatId);
+    }
     if (message.chat && message.chat.type === "private") {
       setMyCommandsForChat_(chatId, user);
     }
@@ -125,9 +129,14 @@ function doPost(e) {
       return okResponse_();
     }
 
-    if (parsed.command === "/status" || parsed.command === "/balance" || parsed.command === "/usage" || parsed.command === "/myinfo" || parsed.command === "/history" || parsed.command === "/upgrade" || parsed.command === "/notify" || parsed.command === "/leaderboard" || parsed.command === "/data" || parsed.command === "/join_waitlist" || parsed.command === "/leave_waitlist") {
+    if (parsed.command === "/status" || parsed.command === "/balance" || parsed.command === "/usage" || parsed.command === "/myinfo" || parsed.command === "/history" || parsed.command === "/upgrade" || parsed.command === "/notify" || parsed.command === "/leaderboard" || parsed.command === "/data" || parsed.command === "/join_waitlist" || parsed.command === "/leave_waitlist" || parsed.command === "/suggest") {
       if (parsed.command === "/upgrade") {
         handleUpgrade_(chatId, parsed.args);
+        processedOk = true;
+        return okResponse_();
+      }
+      if (parsed.command === "/suggest") {
+        handleSuggest_(chatId, message, parsed.args);
         processedOk = true;
         return okResponse_();
       }
@@ -192,7 +201,7 @@ function doPost(e) {
       return okResponse_();
     }
 
-    sendMessage_(chatId, "Unknown command. Use /start, /help, /login, /status, /myinfo, /history, /leaderboard, /data, /upgrade, /notify, /join_waitlist, /leave_waitlist, /logout.");
+    sendMessage_(chatId, "Unknown command. Use /start, /help, /login, /status, /myinfo, /history, /leaderboard, /data, /upgrade, /notify, /join_waitlist, /leave_waitlist, /suggest, /logout.");
     processedOk = true;
     return okResponse_();
   } finally {
@@ -273,6 +282,12 @@ function entryPoint() {
     log_("sheetSystemMessages", { ok: true });
   } catch (eSystemMessages) {
     log_("sheetSystemMessagesError", String(eSystemMessages));
+  }
+  try {
+    getSuggestionsSheet_();
+    log_("sheetSuggestions", { ok: true });
+  } catch (eSuggestions) {
+    log_("sheetSuggestionsError", String(eSuggestions));
   }
 
   var testUser = props.EVS_TEST_USERNAME || "";
@@ -468,6 +483,25 @@ function handleUpgrade_(chatId, args) {
     return;
   }
   sendMessage_(chatId, "Invalid upgrade code.");
+}
+
+function handleSuggest_(chatId, message, args) {
+  var suggestion = args && args.length ? args.join(" ").trim() : "";
+  if (!suggestion) {
+    sendMessage_(chatId, "Usage: /suggest <your suggestion>");
+    return;
+  }
+  var from = message && message.from ? message.from : {};
+  var row = {
+    chat_id: String(chatId || ""),
+    user_id: from.id != null ? String(from.id) : "",
+    username: from.username || "",
+    first_name: from.first_name || "",
+    last_name: from.last_name || "",
+    text: suggestion
+  };
+  logSuggestion_(row);
+  sendMessage_(chatId, "Thanks! Your suggestion has been saved.");
 }
 
 function buildUpgradePromptMessage_(user) {
@@ -704,18 +738,8 @@ function handleHistory_(chatId, user, args) {
     } else {
       subset = pickHistoryDays_(items, days);
     }
-    var lines = [];
-    lines.push("Daily usage (last " + subset.length + " days):");
-    for (var i = 0; i < subset.length; i++) {
-      var item = subset[i] || {};
-      var ts = item.reading_timestamp || "";
-      var dateStr = ts ? String(ts).split("T")[0] : "";
-      var diff = item.reading_diff != null ? Number(item.reading_diff) : null;
-      var diffStr = diff != null && isFinite(diff) ? diff.toFixed(2) : "n/a";
-      var est = item.is_estimated ? " (est)" : "";
-      lines.push(dateStr + ": " + diffStr + est);
-    }
-    sendMessage_(chatId, lines.join("\n"));
+    var message = buildUsageHistoryMessage_(subset, days);
+    sendHtmlMessage_(chatId, message);
   } catch (err) {
     sendMessage_(chatId, "Error: " + err);
   }
@@ -739,6 +763,106 @@ function pickHistoryDays_(items, days) {
     if (ordered.length >= days) break;
   }
   return ordered;
+}
+
+function buildUsageHistoryMessage_(items, requestedDays) {
+  if (!items || !items.length) return "No history data available.";
+  var unitLabel = "$";
+  var values = [];
+  var labels = [];
+  var hasEst = false;
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i] || {};
+    var ts = item.reading_timestamp || "";
+    var dateStr = ts ? String(ts).split("T")[0] : "";
+    var diff = item.reading_diff != null ? Number(item.reading_diff) : null;
+    if (!isFinite(diff)) continue;
+    values.push(Math.abs(diff));
+    labels.push({ date: dateStr, est: !!item.is_estimated });
+    if (item.is_estimated) hasEst = true;
+  }
+  if (!values.length) return "No history data available.";
+
+  var stats = computeUsageStats_(values);
+  var spark = formatSparkline_(values);
+  var lines = [];
+  lines.push("Daily usage (last " + values.length + " days):");
+  if (spark) {
+    lines.push("<code>" + spark + "</code>");
+  }
+  lines.push("min " + unitLabel + stats.min.toFixed(2) + " | avg " + unitLabel + stats.avg.toFixed(2) + " | max " + unitLabel + stats.max.toFixed(2));
+  lines.push("");
+  var bars = formatUsageBars_(labels, values, 12);
+  for (var b = 0; b < bars.length; b++) {
+    lines.push("<code>" + bars[b] + "</code>");
+  }
+  if (hasEst) {
+    lines.push("");
+    lines.push("Note: (est) = estimated from logged balance data.");
+  }
+  lines.push("");
+  lines.push("Tip: /history &lt;days&gt; to view more days.");
+  return lines.join("\n");
+}
+
+function computeUsageStats_(values) {
+  var min = values[0];
+  var max = values[0];
+  var sum = 0;
+  for (var i = 0; i < values.length; i++) {
+    var v = values[i];
+    if (v < min) min = v;
+    if (v > max) max = v;
+    sum += v;
+  }
+  return { min: min, max: max, avg: sum / values.length };
+}
+
+function formatSparkline_(values) {
+  var levels = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+  var min = values[0];
+  var max = values[0];
+  for (var i = 1; i < values.length; i++) {
+    if (values[i] < min) min = values[i];
+    if (values[i] > max) max = values[i];
+  }
+  if (!isFinite(min) || !isFinite(max)) return "";
+  if (max === min) {
+    return repeatChar_(levels[Math.floor(levels.length / 2)], values.length);
+  }
+  var out = "";
+  for (var j = 0; j < values.length; j++) {
+    var ratio = (values[j] - min) / (max - min);
+    var idx = Math.max(0, Math.min(levels.length - 1, Math.round(ratio * (levels.length - 1))));
+    out += levels[idx];
+  }
+  return out;
+}
+
+function formatUsageBars_(labels, values, width) {
+  var max = 0;
+  for (var i = 0; i < values.length; i++) {
+    if (values[i] > max) max = values[i];
+  }
+  if (max <= 0) return [];
+  var out = [];
+  for (var j = 0; j < values.length; j++) {
+    var v = values[j];
+    var barLen = Math.round((v / max) * width);
+    if (v > 0 && barLen < 1) barLen = 1;
+    if (barLen > width) barLen = width;
+    var bar = repeatChar_("█", barLen) + repeatChar_("░", width - barLen);
+    var est = labels[j].est ? " (est)" : "";
+    out.push(labels[j].date + "  $" + v.toFixed(2) + "  " + bar + est);
+  }
+  return out;
+}
+
+function repeatChar_(ch, count) {
+  if (count <= 0) return "";
+  var out = "";
+  for (var i = 0; i < count; i++) out += ch;
+  return out;
 }
 
 function handleLeaderboard_(chatId, user, args) {
@@ -1122,11 +1246,28 @@ function computeAvgLines_(history) {
   var lines = [];
   for (var i = 0; i < windows.length; i++) {
     var w = windows[i];
-    var avg = computeAvgDaily_(items, w);
-    if (avg == null || !isFinite(avg)) continue;
-    lines.push("Avg daily (" + w + "d): " + avg.toFixed(2));
+    var total = computeTotalUsage_(items, w);
+    if (total == null || !isFinite(total)) continue;
+    var avg = total / Math.min(w, items.length);
+    if (!isFinite(avg)) continue;
+    lines.push("Avg daily / Total (" + w + "d): $" + avg.toFixed(2) + " / $" + total.toFixed(2));
   }
   return lines;
+}
+
+function computeTotalUsage_(items, days) {
+  if (!items || !items.length) return null;
+  var count = Math.min(days, items.length);
+  var sum = 0;
+  var used = 0;
+  for (var i = 0; i < count; i++) {
+    var diff = items[i] && items[i].reading_diff != null ? Number(items[i].reading_diff) : null;
+    if (diff == null || !isFinite(diff)) continue;
+    sum += Math.abs(diff);
+    used++;
+  }
+  if (!used) return null;
+  return sum;
 }
 
 function computeAvgDaily_(items, days) {
@@ -1357,6 +1498,40 @@ function getUpgradeCodes_(props) {
     }
   }
   return codes;
+}
+
+function shouldAutoGrantPremium_(user) {
+  if (!user || isPremiumUser_(user)) return false;
+  var props = PropertiesService.getScriptProperties();
+  var enabledRaw = String(props.getProperty("AUTO_GRANT_PREMIUM") || "").trim();
+  if (enabledRaw !== "1") return false;
+  var maxRaw = props.getProperty("AUTO_GRANT_MAX");
+  var max = maxRaw != null && maxRaw !== "" ? Number(maxRaw) : NaN;
+  if (!isFinite(max) || max <= 0) return false;
+  var count = countPremiumUsers_();
+  return count < max;
+}
+
+function countPremiumUsers_() {
+  var users = getAllUsers_();
+  if (!users.length) return 0;
+  var count = 0;
+  for (var i = 0; i < users.length; i++) {
+    if (isPremiumUser_(users[i])) count++;
+  }
+  return count;
+}
+
+function grantPremiumToUser_(chatId, user) {
+  var props = PropertiesService.getScriptProperties();
+  var code = String(props.getProperty("TELEGRAM_UPGRADE_CODE_AUTO_GRANT") || "").trim();
+  var maxRaw = props.getProperty("AUTO_GRANT_MAX");
+  var max = maxRaw != null && maxRaw !== "" ? Number(maxRaw) : NaN;
+  var currentCount = countPremiumUsers_();
+  setUser_(chatId, { is_premium: "true", notify_enabled: "true", upgrade_code: code });
+  var number = currentCount + 1;
+  var totalLabel = isFinite(max) && max > 0 ? max : "N/A";
+  sendMessage_(chatId, "Congrats! You have been granted a free premium account. License number " + number + " out of " + totalLabel + ".");
 }
 
 function sendMessage_(chatId, text) {
@@ -1608,6 +1783,66 @@ function getLogsSheet_() {
     ]);
   }
   return sheet;
+}
+
+function getSuggestionsSheet_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("suggestions");
+  if (!sheet) {
+    sheet = ss.insertSheet("suggestions");
+  }
+  ensureSuggestionsHeader_(sheet);
+  return sheet;
+}
+
+function ensureSuggestionsHeader_(sheet) {
+  var header = [
+    "timestamp",
+    "chat_id",
+    "user_id",
+    "tg_username",
+    "tg_first_name",
+    "tg_last_name",
+    "suggestion"
+  ];
+  var lastRow = sheet.getLastRow();
+  if (lastRow === 0) {
+    sheet.appendRow(header);
+    return;
+  }
+  var existing = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var changed = false;
+  for (var i = 0; i < header.length; i++) {
+    if (!existing[i]) {
+      existing[i] = header[i];
+      changed = true;
+    }
+  }
+  if (changed) {
+    sheet.getRange(1, 1, 1, header.length).setValues([existing.slice(0, header.length)]);
+  }
+  if (sheet.getLastColumn() < header.length) {
+    sheet.insertColumnsAfter(sheet.getLastColumn(), header.length - sheet.getLastColumn());
+    sheet.getRange(1, 1, 1, header.length).setValues([header]);
+  }
+}
+
+function logSuggestion_(row) {
+  try {
+    var sheet = getSuggestionsSheet_();
+    var ts = new Date().toISOString();
+    sheet.appendRow([
+      ts,
+      row.chat_id || "",
+      row.user_id || "",
+      row.username || "",
+      row.first_name || "",
+      row.last_name || "",
+      row.text || ""
+    ]);
+  } catch (e) {
+    logEvent_("suggestion_log_error", { chat_id: row.chat_id || "", error: String(e) });
+  }
 }
 
 function getSystemMessagesSheet_() {
@@ -1963,6 +2198,9 @@ function buildWelcomeMessage_() {
     "<b>Important: This bot is not affiliated with EVS or NUS. There is no expectation of privacy. If you want full data ownership, deploy your own instance from:</b>",
     '<b><a href="https://github.com/lucasisnotcool/evs_bot">GitHub repo</a></b>',
     "",
+    "Have feedback? Send it anytime:",
+    "<code>/suggest your idea</code>",
+    "",
     "To get started, /login:",
     "<code>/login &lt;username&gt; &lt;password&gt;</code>",
     "",
@@ -1973,19 +2211,32 @@ function buildWelcomeMessage_() {
 
 function buildHelpMessage_() {
   return [
-    "Commands:",
+    "Getting started:",
+    "/start - welcome + setup instructions",
+    "/help - show this help",
     "/login <username> <password> - link your EVS account",
+    "/logout - unlink your EVS account",
+    "",
+    "Daily usage + meter info:",
     "/status - meter info + balance + usage",
     "/myinfo - meter details + location",
-    "/history [days] - daily usage (default 7)",
+    "/history [days] - usage history + charts (default 7)",
     "/leaderboard - usage rank snapshots",
-    "/data [days] - view logged balance data (premium)",
+    "",
+    "Premium:",
     "/upgrade <code> - unlock premium features",
+    "/data [days] - view logged balance data",
+    "/notify - manage notifications",
+    "",
+    "Waitlist:",
     "/join_waitlist - join premium waitlist",
     "/leave_waitlist - leave premium waitlist",
-    "/notify - manage notifications (premium)",
-    "/logout - unlink your EVS account",
-    "/help - show this help"
+    "",
+    "Shortcuts:",
+    "/balance - alias for /status",
+    "/usage - alias for /status",
+    "",
+    "/suggest <your suggestion> - send feedback"
   ].join("\n");
 }
 
@@ -2049,6 +2300,10 @@ function dispatchCommand_(chatId, commandText) {
   }
   if (parsed.command === "/upgrade") {
     handleUpgrade_(chatId, parsed.args);
+    return;
+  }
+  if (parsed.command === "/suggest") {
+    handleSuggest_(chatId, null, parsed.args);
     return;
   }
   if (parsed.command === "/join_waitlist") {
