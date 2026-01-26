@@ -413,7 +413,11 @@ function handleStatus_(chatId, user, options) {
       }
     }
     lines.push('Top up / portal: <a href="https://nus-utown.evs.com.sg/EVSWebPOS/">EVS WebPOS</a>');
-
+    
+    if (isPremiumUser_(user) && shouldPromptNotifySetup_(user)) {
+      lines.push("");
+      lines.push("Tip: With premium, you can use /notify for low balance and runout alerts.");
+    }
     sendHtmlMessage_(chatId, lines.join("\n"));
     return { ok: true };
   } catch (err) {
@@ -423,6 +427,15 @@ function handleStatus_(chatId, user, options) {
     }
     return { ok: false, error: String(err) };
   }
+}
+
+function shouldPromptNotifySetup_(user) {
+  if (!user) return false;
+  var low = user.notify_low_balance ? Number(user.notify_low_balance) : NaN;
+  var runout = user.notify_runout_days_ahead ? Number(user.notify_runout_days_ahead) : NaN;
+  var hasLow = isFinite(low) && low > 0;
+  var hasRunout = isFinite(runout) && runout >= 0;
+  return !hasLow && !hasRunout;
 }
 
 function handleBalance_(chatId, user) {
