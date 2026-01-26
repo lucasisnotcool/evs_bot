@@ -68,10 +68,14 @@ function doPost(e) {
       upsertTelegramUser_(chatId, message.from);
       user = getUser_(chatId);
     }
+    if (message.chat && message.chat.type === "private") {
+      setMyCommandsForChat_(chatId, user);
+    }
     var parsed = parseCommand_(text);
 
     if (parsed.command === "/start") {
-      sendMessage_(chatId, buildWelcomeMessage_());
+      setMyCommandsForChat_(chatId, user);
+      sendHtmlMessage_(chatId, buildWelcomeMessage_());
       processedOk = true;
       return okResponse_();
     }
@@ -94,7 +98,7 @@ function doPost(e) {
         sendMessage_(chatId, "Logging in and fetching your meter data...");
         var statusRes = handleStatus_(chatId, getUser_(chatId), { suppressErrors: true });
         if (statusRes.ok) {
-          // no extra options message
+          setMyCommandsForChat_(chatId, getUser_(chatId));
         } else {
           sendMessage_(chatId, loginFailureMessage_(statusRes.error));
         }
@@ -115,14 +119,25 @@ function doPost(e) {
         meter_displayname: "",
         meter_sn: ""
       });
+      setMyCommandsForChat_(chatId, null);
       sendMessage_(chatId, "Logged out. Your EVS account has been unlinked.");
       processedOk = true;
       return okResponse_();
     }
 
-    if (parsed.command === "/status" || parsed.command === "/balance" || parsed.command === "/usage" || parsed.command === "/myinfo" || parsed.command === "/history" || parsed.command === "/upgrade" || parsed.command === "/notify" || parsed.command === "/leaderboard" || parsed.command === "/data") {
+    if (parsed.command === "/status" || parsed.command === "/balance" || parsed.command === "/usage" || parsed.command === "/myinfo" || parsed.command === "/history" || parsed.command === "/upgrade" || parsed.command === "/notify" || parsed.command === "/leaderboard" || parsed.command === "/data" || parsed.command === "/join_waitlist" || parsed.command === "/leave_waitlist") {
       if (parsed.command === "/upgrade") {
         handleUpgrade_(chatId, parsed.args);
+        processedOk = true;
+        return okResponse_();
+      }
+      if (parsed.command === "/join_waitlist") {
+        handleWaitlistJoin_(chatId);
+        processedOk = true;
+        return okResponse_();
+      }
+      if (parsed.command === "/leave_waitlist") {
+        handleWaitlistLeave_(chatId);
         processedOk = true;
         return okResponse_();
       }
@@ -132,10 +147,8 @@ function doPost(e) {
         processedOk = true;
         return okResponse_();
       }
-      if (parsed.command === "/balance") {
-        handleBalance_(chatId, user);
-      } else if (parsed.command === "/usage") {
-        handleUsage_(chatId, user);
+      if (parsed.command === "/balance" || parsed.command === "/usage") {
+        handleStatus_(chatId, user);
       } else if (parsed.command === "/myinfo") {
         handleMyInfo_(chatId, user);
       } else if (parsed.command === "/history") {
@@ -171,7 +184,7 @@ function doPost(e) {
       sendMessage_(chatId, "Logging in and fetching your meter data...");
       var statusRes2 = handleStatus_(chatId, getUser_(chatId), { suppressErrors: true });
       if (statusRes2.ok) {
-        // no extra options message
+        setMyCommandsForChat_(chatId, getUser_(chatId));
       } else {
         sendMessage_(chatId, loginFailureMessage_(statusRes2.error));
       }
@@ -179,7 +192,7 @@ function doPost(e) {
       return okResponse_();
     }
 
-    sendMessage_(chatId, "Unknown command. Use /start, /help, /login, /status, /myinfo, /history, /leaderboard, /data, /upgrade, /notify, /logout.");
+    sendMessage_(chatId, "Unknown command. Use /start, /help, /login, /status, /myinfo, /history, /leaderboard, /data, /upgrade, /notify, /join_waitlist, /leave_waitlist, /logout.");
     processedOk = true;
     return okResponse_();
   } finally {
@@ -235,6 +248,31 @@ function entryPoint() {
     log_("setMyCommands", cmdRes);
   } catch (errCmd) {
     log_("setMyCommandsError", String(errCmd));
+  }
+
+  try {
+    getUsersSheet_();
+    log_("sheetUsers", { ok: true });
+  } catch (eUsers) {
+    log_("sheetUsersError", String(eUsers));
+  }
+  try {
+    getLogsSheet_();
+    log_("sheetLogs", { ok: true });
+  } catch (eLogs) {
+    log_("sheetLogsError", String(eLogs));
+  }
+  try {
+    getAccountBalancesSheet_();
+    log_("sheetAccountBalances", { ok: true });
+  } catch (eBalances) {
+    log_("sheetAccountBalancesError", String(eBalances));
+  }
+  try {
+    getSystemMessagesSheet_();
+    log_("sheetSystemMessages", { ok: true });
+  } catch (eSystemMessages) {
+    log_("sheetSystemMessagesError", String(eSystemMessages));
   }
 
   var testUser = props.EVS_TEST_USERNAME || "";
@@ -409,21 +447,125 @@ function handleUpgrade_(chatId, args) {
   var props = PropertiesService.getScriptProperties();
   var all = props.getProperties();
   var codes = getUpgradeCodes_(all);
+  var user = getUser_(chatId) || {};
+  if (isPremiumUser_(user)) {
+    sendMessage_(chatId, "Premium already enabled.");
+    return;
+  }
   if (!codes.length) {
     sendMessage_(chatId, "Upgrade is not configured. Please contact the administrator.");
     return;
   }
   if (!args || !args.length) {
-    sendMessage_(chatId, "Usage: /upgrade <code>");
+    sendMessage_(chatId, buildUpgradePromptMessage_(user));
     return;
   }
   var code = String(args[0] || "").trim();
   if (code && codes.indexOf(code) !== -1) {
     setUser_(chatId, { is_premium: "true", notify_enabled: "true", upgrade_code: code });
+    setMyCommandsForChat_(chatId, getUser_(chatId));
     sendMessage_(chatId, "Upgrade successful. Premium features enabled.");
     return;
   }
   sendMessage_(chatId, "Invalid upgrade code.");
+}
+
+function buildUpgradePromptMessage_(user) {
+  var lines = [];
+  lines.push("Usage: /upgrade <code>");
+  var waitInfo = getWaitlistInfo_(user);
+  if (waitInfo) {
+    lines.push("");
+    lines.push("Waitlist: joined");
+    lines.push("Joined: " + formatWaitlistJoinedLabel_(waitInfo.joined_at));
+    lines.push("Position: " + waitInfo.position + " of " + waitInfo.total);
+    lines.push("Use /leave_waitlist to leave the waitlist.");
+  } else {
+    lines.push("");
+    lines.push("Not on waitlist. Use /join_waitlist to join.");
+  }
+  return lines.join("\n");
+}
+
+function handleWaitlistJoin_(chatId) {
+  var user = getUser_(chatId) || {};
+  var joinedAt = user.waitlist_joined_at ? String(user.waitlist_joined_at) : "";
+  if (String(user.waitlist_status || "").toLowerCase() === "true" && joinedAt) {
+    var info = getWaitlistInfo_(user);
+    if (info) {
+      sendMessage_(chatId, "Waitlist already joined. Position " + info.position + " of " + info.total + ". Joined " + formatWaitlistJoinedLabel_(info.joined_at) + ".");
+      return;
+    }
+  }
+  var nowIso = new Date().toISOString();
+  setUser_(chatId, { waitlist_status: "true", waitlist_joined_at: nowIso });
+  var info2 = getWaitlistInfo_(getUser_(chatId));
+  if (info2) {
+    sendMessage_(chatId, "Waitlist joined. Position " + info2.position + " of " + info2.total + ". Joined " + formatWaitlistJoinedLabel_(info2.joined_at) + ".");
+    return;
+  }
+  sendMessage_(chatId, "Waitlist joined.");
+}
+
+function handleWaitlistLeave_(chatId) {
+  var user = getUser_(chatId) || {};
+  if (String(user.waitlist_status || "").toLowerCase() !== "true") {
+    sendMessage_(chatId, "You are not on the waitlist.");
+    return;
+  }
+  setUser_(chatId, { waitlist_status: "", waitlist_joined_at: "" });
+  sendMessage_(chatId, "Removed from waitlist.");
+}
+
+function getWaitlistInfo_(user) {
+  if (!user || String(user.waitlist_status || "").toLowerCase() !== "true") return null;
+  var joinedAt = user.waitlist_joined_at ? String(user.waitlist_joined_at) : "";
+  if (!joinedAt) return null;
+  var queue = getWaitlistQueue_();
+  if (!queue.length) return null;
+  for (var i = 0; i < queue.length; i++) {
+    if (String(queue[i].chat_id) === String(user.chat_id)) {
+      return { position: i + 1, total: queue.length, joined_at: joinedAt };
+    }
+  }
+  return null;
+}
+
+function getWaitlistQueue_() {
+  var users = getAllUsers_();
+  var out = [];
+  for (var i = 0; i < users.length; i++) {
+    var u = users[i];
+    if (String(u.waitlist_status || "").toLowerCase() !== "true") continue;
+    var joinedAt = u.waitlist_joined_at ? String(u.waitlist_joined_at) : "";
+    if (!joinedAt) continue;
+    out.push({ chat_id: u.chat_id, joined_at: joinedAt });
+  }
+  out.sort(function (a, b) {
+    return String(a.joined_at).localeCompare(String(b.joined_at));
+  });
+  return out;
+}
+
+function formatWaitlistJoinedLabel_(joinedAt) {
+  if (!joinedAt) return "unknown";
+  var date = new Date(joinedAt);
+  if (!isFinite(date.getTime())) return String(joinedAt);
+  var sgt = formatSgtDateTime_(date) + " SGT";
+  return sgt + " (" + formatRelativeAge_(date) + " ago)";
+}
+
+function formatRelativeAge_(date) {
+  var now = new Date();
+  var diffMs = now.getTime() - date.getTime();
+  if (!isFinite(diffMs) || diffMs < 0) return "just now";
+  var diffMin = Math.floor(diffMs / (60 * 1000));
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return diffMin + " min";
+  var diffHours = Math.floor(diffMin / 60);
+  if (diffHours < 48) return diffHours + " h";
+  var diffDays = Math.floor(diffHours / 24);
+  return diffDays + " d";
 }
 
 function handleNotify_(chatId, user, args) {
@@ -1188,15 +1330,18 @@ function normalizeDateKey_(val) {
 }
 
 function automationsDaily() {
-  // Reserved for future daily jobs.
+  logEvent_("automation_run", { name: "automationsDaily" });
+  clearOldLogs_();
 }
 
 function automationsHourly() {
+  logEvent_("automation_run", { name: "automationsHourly" });
   logPremiumBalances_();
   checkNotifications_();
 }
 
 function runAutomations() {
+  logEvent_("automation_run", { name: "runAutomations" });
   automationsDaily();
   automationsHourly();
 }
@@ -1334,11 +1479,13 @@ function setUser_(chatId, fields) {
       fields.notify_runout_days_ahead || "",
       fields.notify_runout_windows || "",
       fields.notify_last_low_date || "",
-      fields.notify_last_runout_date || ""
+      fields.notify_last_runout_date || "",
+      fields.waitlist_status || "",
+      fields.waitlist_joined_at || ""
     ];
     sheet.appendRow(newRow);
   } else {
-    var current = rowToUser_(sheet.getRange(row, 1, 1, 18).getValues()[0]);
+    var current = rowToUser_(sheet.getRange(row, 1, 1, 20).getValues()[0]);
     var updated = [
       chatId,
       fields.username != null ? fields.username : current.username,
@@ -1357,9 +1504,11 @@ function setUser_(chatId, fields) {
       fields.notify_runout_days_ahead != null ? fields.notify_runout_days_ahead : current.notify_runout_days_ahead,
       fields.notify_runout_windows != null ? fields.notify_runout_windows : current.notify_runout_windows,
       fields.notify_last_low_date != null ? fields.notify_last_low_date : current.notify_last_low_date,
-      fields.notify_last_runout_date != null ? fields.notify_last_runout_date : current.notify_last_runout_date
+      fields.notify_last_runout_date != null ? fields.notify_last_runout_date : current.notify_last_runout_date,
+      fields.waitlist_status != null ? fields.waitlist_status : current.waitlist_status,
+      fields.waitlist_joined_at != null ? fields.waitlist_joined_at : current.waitlist_joined_at
     ];
-    sheet.getRange(row, 1, 1, 18).setValues([updated]);
+    sheet.getRange(row, 1, 1, 20).setValues([updated]);
   }
 }
 
@@ -1382,7 +1531,9 @@ function rowToUser_(row) {
     notify_runout_days_ahead: row[14] || "",
     notify_runout_windows: row[15] || "",
     notify_last_low_date: row[16] || "",
-    notify_last_runout_date: row[17] || ""
+    notify_last_runout_date: row[17] || "",
+    waitlist_status: row[18] || "",
+    waitlist_joined_at: row[19] || ""
   };
 }
 
@@ -1415,7 +1566,9 @@ function ensureUsersHeader_(sheet) {
     "notify_runout_days_ahead",
     "notify_runout_windows",
     "notify_last_low_date",
-    "notify_last_runout_date"
+    "notify_last_runout_date",
+    "waitlist_status",
+    "waitlist_joined_at"
   ];
   var lastRow = sheet.getLastRow();
   if (lastRow === 0) {
@@ -1455,6 +1608,75 @@ function getLogsSheet_() {
     ]);
   }
   return sheet;
+}
+
+function getSystemMessagesSheet_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("system_messages");
+  if (!sheet) {
+    sheet = ss.insertSheet("system_messages");
+  }
+  ensureSystemMessagesHeader_(sheet);
+  return sheet;
+}
+
+function ensureSystemMessagesHeader_(sheet) {
+  var header = [
+    "message",
+    "sent_at",
+    "sent_chat_ids",
+    "sent_count"
+  ];
+  var lastRow = sheet.getLastRow();
+  if (lastRow === 0) {
+    sheet.appendRow(header);
+    return;
+  }
+  var existing = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var changed = false;
+  for (var i = 0; i < header.length; i++) {
+    if (!existing[i]) {
+      existing[i] = header[i];
+      changed = true;
+    }
+  }
+  if (changed) {
+    sheet.getRange(1, 1, 1, header.length).setValues([existing.slice(0, header.length)]);
+  }
+  if (sheet.getLastColumn() < header.length) {
+    sheet.insertColumnsAfter(sheet.getLastColumn(), header.length - sheet.getLastColumn());
+    sheet.getRange(1, 1, 1, header.length).setValues([header]);
+  }
+}
+
+function sendSystemMessages() {
+  var sheet = getSystemMessagesSheet_();
+  var data = sheet.getDataRange().getValues();
+  if (data.length < 2) return;
+  var users = getAllUsers_();
+  if (!users.length) return;
+  var sentRows = 0;
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    var message = row[0] != null ? String(row[0]).trim() : "";
+    var sentAt = row[1];
+    if (!message) continue;
+    if (sentAt) continue;
+    var sentChatIds = [];
+    for (var u = 0; u < users.length; u++) {
+      var chatId = users[u].chat_id;
+      if (!chatId) continue;
+      var res = sendHtmlMessage_(chatId, message);
+      if (res && res.ok) sentChatIds.push(String(chatId));
+    }
+    var nowIso = new Date().toISOString();
+    sheet.getRange(i + 1, 2, 1, 3).setValues([[nowIso, JSON.stringify(sentChatIds), sentChatIds.length]]);
+    sentRows++;
+    logEvent_("system_message_sent", { row: i + 1, sent_count: sentChatIds.length });
+  }
+  if (sentRows) {
+    logEvent_("system_messages_run", { rows_sent: sentRows });
+  }
 }
 
 function getAccountBalancesSheet_() {
@@ -1702,6 +1924,29 @@ function logEvent_(type, data) {
   }
 }
 
+function clearOldLogs_() {
+  var sheet = getLogsSheet_();
+  var data = sheet.getDataRange().getValues();
+  if (data.length <= 1) return;
+  var cutoff = new Date(Date.now() - (7 * 24 * 60 * 60 * 1000));
+  var kept = [data[0]];
+  var cleared = 0;
+  for (var i = 1; i < data.length; i++) {
+    var ts = data[i][0];
+    var tsDate = ts ? new Date(ts) : null;
+    if (tsDate && isFinite(tsDate.getTime()) && tsDate < cutoff) {
+      cleared++;
+      continue;
+    }
+    kept.push(data[i]);
+  }
+  if (cleared) {
+    sheet.clearContents();
+    sheet.getRange(1, 1, kept.length, kept[0].length).setValues(kept);
+    logEvent_("logs_cleared", { cleared: cleared, remaining: kept.length - 1 });
+  }
+}
+
 function parseCommand_(text) {
   var clean = normalizeText_(text);
   var parts = clean.split(/\s+/).filter(function (p) { return p; });
@@ -1715,11 +1960,14 @@ function buildWelcomeMessage_() {
   return [
     "Welcome! This bot links your EVS account to show your meter info, balance, and month-to-date usage.",
     "",
-    "To get started, login:",
-    "/login <username> <password>",
+    "<b>Important: This bot is not affiliated with EVS or NUS. There is no expectation of privacy. If you want full data ownership, deploy your own instance from:</b>",
+    '<b><a href="https://github.com/lucasisnotcool/evs_bot">GitHub repo</a></b>',
+    "",
+    "To get started, /login:",
+    "<code>/login &lt;username&gt; &lt;password&gt;</code>",
     "",
     "Example:",
-    "/login 10001234 0A1234"
+    "<code>/login 10001234 0A1234</code>"
   ].join("\n");
 }
 
@@ -1733,6 +1981,8 @@ function buildHelpMessage_() {
     "/leaderboard - usage rank snapshots",
     "/data [days] - view logged balance data (premium)",
     "/upgrade <code> - unlock premium features",
+    "/join_waitlist - join premium waitlist",
+    "/leave_waitlist - leave premium waitlist",
     "/notify - manage notifications (premium)",
     "/logout - unlink your EVS account",
     "/help - show this help"
@@ -1743,12 +1993,12 @@ function buildCapabilitiesMessage_() {
   return [
     "You're logged in. Here’s what I can do:",
     "• /status - meter info + balance + usage",
-    "• /balance - credit balance",
-    "• /usage - month-to-date usage",
     "• /myinfo - meter details + location",
     "• /history [days] - daily usage (default 7)",
     "• /leaderboard - usage rank snapshots",
     "• /data [days] - view logged balance data (premium)",
+    "• /join_waitlist - join premium waitlist",
+    "• /leave_waitlist - leave premium waitlist",
     "• /logout - unlink your EVS account",
     "",
     "Use the buttons below or type a command."
@@ -1801,8 +2051,17 @@ function dispatchCommand_(chatId, commandText) {
     handleUpgrade_(chatId, parsed.args);
     return;
   }
+  if (parsed.command === "/join_waitlist") {
+    handleWaitlistJoin_(chatId);
+    return;
+  }
+  if (parsed.command === "/leave_waitlist") {
+    handleWaitlistLeave_(chatId);
+    return;
+  }
   if (parsed.command === "/logout") {
     setUser_(chatId, { username: "", password: "", state: "", meter_displayname: "", meter_sn: "" });
+    setMyCommandsForChat_(chatId, null);
     sendMessage_(chatId, "Logged out. Your EVS account has been unlinked.");
     return;
   }
@@ -1812,10 +2071,8 @@ function dispatchCommand_(chatId, commandText) {
       sendMessage_(chatId, "Please login first. Send /login <username> <password>.");
       return;
     }
-    if (parsed.command === "/balance") {
-      handleBalance_(chatId, user);
-    } else if (parsed.command === "/usage") {
-      handleUsage_(chatId, user);
+    if (parsed.command === "/balance" || parsed.command === "/usage") {
+      handleStatus_(chatId, user);
     } else if (parsed.command === "/myinfo") {
       handleMyInfo_(chatId, user);
     } else if (parsed.command === "/history") {
@@ -1833,19 +2090,55 @@ function dispatchCommand_(chatId, commandText) {
 }
 
 function setMyCommandsDefault_() {
-  var commands = [
+  var commands = getCommandsLoggedOut_();
+  return tgRequest_("setMyCommands", { commands: commands, scope: { type: "all_private_chats" } });
+}
+
+function setMyCommandsForChat_(chatId, user) {
+  var commands = getCommandsForUser_(user);
+  if (!commands || !commands.length) return;
+  return tgRequest_("setMyCommands", { commands: commands, scope: { type: "chat", chat_id: chatId } });
+}
+
+function getCommandsForUser_(user) {
+  if (!user || !user.username || !user.password) return getCommandsLoggedOut_();
+  if (isPremiumUser_(user)) return getCommandsLoggedInPremium_();
+  return getCommandsLoggedIn_();
+}
+
+function getCommandsLoggedOut_() {
+  return [
     { command: "start", description: "Welcome + setup instructions" },
-    { command: "login", description: "Link your EVS account" },
+    { command: "help", description: "Show help" },
+    { command: "login", description: "Link your EVS account" }
+  ];
+}
+
+function getCommandsLoggedIn_() {
+  return [
     { command: "status", description: "Meter info + balance + usage" },
     { command: "myinfo", description: "Meter details + location" },
     { command: "history", description: "Daily usage history" },
     { command: "leaderboard", description: "Usage rank snapshots" },
-    { command: "data", description: "View logged balance data (premium)" },
-    // { command: "upgrade", description: "Unlock premium features" }, // removed from this list, users can discover when they try premium features
-    { command: "notify", description: "Notifications (premium)" },
+    { command: "upgrade", description: "Unlock premium features" },
+    // { command: "join_waitlist", description: "Join premium waitlist" },
+    // { command: "leave_waitlist", description: "Leave premium waitlist" },
+    { command: "help", description: "Show help" },
     { command: "logout", description: "Unlink your EVS account" }
   ];
-  return tgRequest_("setMyCommands", { commands: commands, scope: { type: "all_private_chats" } });
+}
+
+function getCommandsLoggedInPremium_() {
+  return [
+    { command: "status", description: "Meter info + balance + usage" },
+    { command: "myinfo", description: "Meter details + location" },
+    { command: "history", description: "Daily usage history" },
+    { command: "leaderboard", description: "Usage rank snapshots" },
+    { command: "data", description: "View logged balance data" },
+    { command: "notify", description: "Notifications" },
+    { command: "help", description: "Show help" },
+    { command: "logout", description: "Unlink your EVS account" }
+  ];
 }
 
 function getAllowedUpdates_() {

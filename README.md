@@ -1,6 +1,10 @@
 # EVS Telegram Bot for Google Apps Script
 
-Telegram bot that logs into EVS, shows meter info, balance, usage, and supports premium features like notifications and balance logging.
+Telegram bot that logs into EVS, shows meter info, balance, usage, and supports premium features like notifications and balance logging. Premium features are features that require an upgrade code to unlock, because they rely on more expensive automated data fetching and storage. 
+
+With this repo, you can deploy your own bot using Google Apps Script and Google Sheets for storage, giving you access to premium features and full data ownership.
+
+This app does not require any external services beyond Google and EVS, and all code is open source. It only relies on free-tier Google Apps Script and Telegram Bots. 
 
 ## Setup
 1. Create a Google Sheet and open Extensions -> Apps Script.
@@ -11,7 +15,7 @@ Telegram bot that logs into EVS, shows meter info, balance, usage, and supports 
    - `TELEGRAM_ALLOWED_UPDATES` optional JSON list of Telegram update types
    - `TELEGRAM_AUTO_WEBHOOK` optional true to auto set webhook in `entryPoint`
    - `TELEGRAM_UPGRADE_CODE*` optional premium codes, use suffixes for multiple codes
-   - `EVS_CARBON_KG_PER_KWH` optional carbon factor for leaderboard
+   - `EVS_CARBON_KG_PER_KWH` optional carbon factor for leaderboard calculations
    - `EVS_TEST_USERNAME` optional test username used by `entryPoint`
    - `EVS_TEST_PASSWORD` optional test password used by `entryPoint`
    - `TELEGRAM_LAST_UPDATE_ID` set automatically to dedupe updates
