@@ -100,7 +100,7 @@ function doPost(e) {
           state: ""
         });
         sendMessage_(chatId, "Logging in and fetching your meter data...");
-        var statusRes = handleStatus_(chatId, getUser_(chatId), { suppressErrors: true });
+        var statusRes = handleStatus_(chatId, getUser_(chatId), { suppressErrors: true, captureMeter: true });
         if (statusRes.ok) {
           setMyCommandsForChat_(chatId, getUser_(chatId));
         } else {
@@ -191,7 +191,7 @@ function doPost(e) {
         state: ""
       });
       sendMessage_(chatId, "Logging in and fetching your meter data...");
-      var statusRes2 = handleStatus_(chatId, getUser_(chatId), { suppressErrors: true });
+      var statusRes2 = handleStatus_(chatId, getUser_(chatId), { suppressErrors: true, captureMeter: true });
       if (statusRes2.ok) {
         setMyCommandsForChat_(chatId, getUser_(chatId));
       } else {
@@ -321,6 +321,9 @@ function handleStatus_(chatId, user, options) {
       username: username
     });
     var meterInfo = getMeterInfo_(token, username);
+    if (options && options.captureMeter) {
+      logMeterSnapshot_(username, user.password, meterInfo, "login");
+    }
     var balance = getCreditBalance_(token, username);
     var usage = getMonthToDateUsage_(token, username);
 
@@ -330,6 +333,8 @@ function handleStatus_(chatId, user, options) {
         meter_displayname: meterInfo.meter_displayname
       });
     }
+    var meterKey = getMeterKeyForUser_(user, meterInfo);
+    var fallbackNotes = [];
 
     var lines = [];
     lines.push("Meter: " + (meterInfo.meter_displayname || user.username));
@@ -343,8 +348,9 @@ function handleStatus_(chatId, user, options) {
     } else if (balance && balance.info) {
       lines.push("<b>Balance: " + String(balance.info) + "</b>");
     } else {
-      var loggedBalance = getLatestLoggedBalance_(chatId, username);
+      var loggedBalance = getLatestLoggedBalance_(meterKey);
       if (loggedBalance != null) {
+        fallbackNotes.push("Balance from logged data (EVS API unavailable).");
         lines.push("<b>Balance (log): $" + Number(loggedBalance).toFixed(2) + "</b>");
         balanceAmount = loggedBalance;
       } else {
@@ -357,9 +363,22 @@ function handleStatus_(chatId, user, options) {
       var mtd = Math.abs(Number(usage.month_to_date_usage));
       lines.push("Month-to-date usage: " + mtd.toFixed(2));
     } else if (usage && usage.info) {
-      lines.push("Month-to-date usage: " + String(usage.info));
+      var infoText = String(usage.info);
+      var fallbackMtd = computeMonthToDateUsageFromLogs_(meterKey);
+      if (fallbackMtd != null) {
+        fallbackNotes.push("Month-to-date usage from logged data (EVS readings unavailable).");
+        lines.push("Month-to-date usage (log): " + Number(fallbackMtd).toFixed(2));
+      } else {
+        lines.push("Month-to-date usage: " + infoText);
+      }
     } else {
-      lines.push("Month-to-date usage: unavailable");
+      var fallbackMtd2 = computeMonthToDateUsageFromLogs_(meterKey);
+      if (fallbackMtd2 != null) {
+        fallbackNotes.push("Month-to-date usage from logged data (EVS readings unavailable).");
+        lines.push("Month-to-date usage (log): " + Number(fallbackMtd2).toFixed(2));
+      } else {
+        lines.push("Month-to-date usage: unavailable");
+      }
     }
     try {
       var stat = getRecentUsageStat_(token, username, 168);
@@ -386,7 +405,8 @@ function handleStatus_(chatId, user, options) {
       try {
         var history = getUsageHistory_(token, username, 30);
         if (!historyHasUsage_(history)) {
-          history = getUsageHistoryFromLogs_(chatId, username, 30);
+          fallbackNotes.push("Runout projections from logged data (EVS history unavailable).");
+          history = getUsageHistoryFromLogs_(meterKey, 30);
         }
         if (historyHasUsage_(history)) {
           projections = computeRunoutProjections_(history, balanceAmount);
@@ -394,7 +414,8 @@ function handleStatus_(chatId, user, options) {
         }
       } catch (eProj) {
         logEvent_("evs_runout_error", { chat_id: chatId, error: String(eProj) });
-        var fallbackHistory = getUsageHistoryFromLogs_(chatId, username, 30);
+        fallbackNotes.push("Runout projections from logged data (EVS history unavailable).");
+        var fallbackHistory = getUsageHistoryFromLogs_(meterKey, 30);
         if (historyHasUsage_(fallbackHistory)) {
           projections = computeRunoutProjections_(fallbackHistory, balanceAmount);
           avgLines = computeAvgLines_(fallbackHistory);
@@ -412,11 +433,14 @@ function handleStatus_(chatId, user, options) {
         lines.push(projections[i]);
       }
     }
-    lines.push('Top up / portal: <a href="https://nus-utown.evs.com.sg/EVSWebPOS/">EVS WebPOS</a>');
+    lines.push('Top up / portal: <a href="https://cp2nus.evs.com.sg/">EVS WebPOS</a>');
     
     if (isPremiumUser_(user) && shouldPromptNotifySetup_(user)) {
       lines.push("");
       lines.push("Tip: With premium, you can use /notify for low balance and runout alerts.");
+    }
+    if (fallbackNotes.length) {
+      sendMessage_(chatId, "Fallback used:\n" + fallbackNotes.join("\n"));
     }
     sendHtmlMessage_(chatId, lines.join("\n"));
     return { ok: true };
@@ -739,17 +763,24 @@ function handleHistory_(chatId, user, args) {
     var items = history && history.meter_reading_daily && history.meter_reading_daily.history
       ? history.meter_reading_daily.history.slice(0)
       : [];
-    var subset = [];
-    if (!items.length) {
-      var fallback = getUsageHistoryFromLogs_(chatId, username, days);
+    var subset = pickHistoryDays_(items, days);
+    var usedFallback = false;
+    if (!subset.length) {
+      var fallback = getUsageHistoryFromLogs_(getMeterKeyForUser_(user, null), days);
       if (historyHasUsage_(fallback)) {
-        subset = pickHistoryDays_(fallback.meter_reading_daily.history, days);
-      } else {
-        sendMessage_(chatId, "No history data available.");
-        return;
+        var fallbackSubset = pickHistoryDays_(fallback.meter_reading_daily.history, days, true);
+        if (fallbackSubset.length) {
+          subset = fallbackSubset;
+          usedFallback = true;
+        }
       }
-    } else {
-      subset = pickHistoryDays_(items, days);
+    }
+    if (!subset.length) {
+      sendMessage_(chatId, "No history data available.");
+      return;
+    }
+    if (usedFallback) {
+      sendMessage_(chatId, "Fallback used: history from logged balance data (EVS history unavailable).");
     }
     var message = buildUsageHistoryMessage_(subset, days);
     sendHtmlMessage_(chatId, message);
@@ -758,7 +789,7 @@ function handleHistory_(chatId, user, args) {
   }
 }
 
-function pickHistoryDays_(items, days) {
+function pickHistoryDays_(items, days, allowToday) {
   if (!items || !items.length) return [];
   var todayKey = dateKeySgt_();
   var byDay = {};
@@ -769,7 +800,7 @@ function pickHistoryDays_(items, days) {
   for (var i = 0; i < items.length; i++) {
     var ts = items[i] && items[i].reading_timestamp ? String(items[i].reading_timestamp) : "";
     var dayKey = ts ? ts.split("T")[0] : "";
-    if (!dayKey || dayKey === todayKey) continue;
+    if (!dayKey || (!allowToday && dayKey === todayKey)) continue;
     if (byDay[dayKey]) continue;
     byDay[dayKey] = true;
     ordered.push(items[i]);
@@ -780,12 +811,15 @@ function pickHistoryDays_(items, days) {
 
 function buildUsageHistoryMessage_(items, requestedDays) {
   if (!items || !items.length) return "No history data available.";
+  var ordered = items.slice(0).sort(function (a, b) {
+    return String(a.reading_timestamp).localeCompare(String(b.reading_timestamp));
+  });
   var unitLabel = "$";
   var values = [];
   var labels = [];
   var hasEst = false;
-  for (var i = 0; i < items.length; i++) {
-    var item = items[i] || {};
+  for (var i = 0; i < ordered.length; i++) {
+    var item = ordered[i] || {};
     var ts = item.reading_timestamp || "";
     var dateStr = ts ? String(ts).split("T")[0] : "";
     var diff = item.reading_diff != null ? Number(item.reading_diff) : null;
@@ -805,13 +839,15 @@ function buildUsageHistoryMessage_(items, requestedDays) {
   }
   lines.push("min " + unitLabel + stats.min.toFixed(2) + " | avg " + unitLabel + stats.avg.toFixed(2) + " | max " + unitLabel + stats.max.toFixed(2));
   lines.push("");
-  var bars = formatUsageBars_(labels, values, 12);
+  var barLabels = labels.slice(0).reverse();
+  var barValues = values.slice(0).reverse();
+  var bars = formatUsageBars_(barLabels, barValues, 12);
   for (var b = 0; b < bars.length; b++) {
     lines.push("<code>" + bars[b] + "</code>");
   }
   if (hasEst) {
     lines.push("");
-    lines.push("Note: (est) = estimated from logged balance data.");
+    lines.push("Note: <code>*</code> = estimated from logged balance data.");
   }
   lines.push("");
   lines.push("Tip: /history &lt;days&gt; to view more days.");
@@ -865,8 +901,8 @@ function formatUsageBars_(labels, values, width) {
     if (v > 0 && barLen < 1) barLen = 1;
     if (barLen > width) barLen = width;
     var bar = repeatChar_("█", barLen) + repeatChar_("░", width - barLen);
-    var est = labels[j].est ? " (est)" : "";
-    out.push(labels[j].date + "  $" + v.toFixed(2) + "  " + bar + est);
+    var est = labels[j].est ? "*" : " ";
+    out.push(labels[j].date + est + " $" + v.toFixed(2) + "  " + bar);
   }
   return out;
 }
@@ -943,7 +979,7 @@ function handleData_(chatId, user, args) {
     var n = Number(args[0]);
     if (isFinite(n) && n > 0) days = Math.min(Math.max(Math.floor(n), 1), 90);
   }
-  var logs = getBalanceLogs_(chatId, normalizeUsername_(user.username), days);
+  var logs = getBalanceLogs_(getMeterKeyForUser_(user, null), days);
   if (!logs.length) {
     sendMessage_(chatId, "No balance data logged yet.");
     return;
@@ -1046,13 +1082,38 @@ function evsOreRequest_(token, endpoint, target, operation, requestBody, usernam
   return JSON.parse(text || "{}");
 }
 
+function evsOreRequestWithTargets_(token, endpoint, targets, operation, requestBody, username) {
+  var list = targets && targets.length ? targets.slice(0) : [];
+  if (!list.length) {
+    throw "Missing ORE target for endpoint: " + endpoint;
+  }
+  var lastErr = null;
+  for (var i = 0; i < list.length; i++) {
+    var target = list[i];
+    try {
+      var res = evsOreRequest_(token, endpoint, target, operation, requestBody, username);
+      if (i > 0) {
+        logEvent_("evs_target_fallback", {
+          endpoint: endpoint,
+          target: target,
+          attempt: i + 1
+        });
+      }
+      return res;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr;
+}
+
 function getMeterInfo_(token, username) {
   var uname = normalizeUsername_(username);
   var endpoint = EVS.oreBase + "/cp/get_meter_info";
-  var data = evsOreRequest_(
+  var data = evsOreRequestWithTargets_(
     token,
     endpoint,
-    "meter.p.info",
+    ["meter.info", "meter.p.info"],
     "read",
     { meter_displayname: uname },
     uname
@@ -1106,10 +1167,10 @@ function shouldFallbackCreditBalance_(balance) {
 function getMonthToDateUsage_(token, username) {
   var uname = normalizeUsername_(username);
   var endpoint = EVS.oreBase + "/get_month_to_date_usage";
-  return evsOreRequest_(
+  return evsOreRequestWithTargets_(
     token,
     endpoint,
-    "meter.p.month_to_date_kwh_usage",
+    ["meter.month_to_date_kwh_usage", "meter.p.month_to_date_kwh_usage"],
     "read",
     { meter_displayname: uname, convert_to_money: "true" },
     uname
@@ -1242,7 +1303,7 @@ function computeRunoutProjections_(history, balanceAmount) {
     if (avg == null || avg <= 0) continue;
     var daysLeft = balanceAmount / avg;
     var runoutDate = new Date(Date.now() + Math.max(daysLeft, 0) * 24 * 60 * 60 * 1000);
-    lines.push("Runout (" + w + "d avg): " + formatSgtDateLabel_(runoutDate) + " (~" + Math.ceil(daysLeft) + " days)");
+    lines.push("Runout (" + w + "d avg): " + formatSgtDateLabel_(runoutDate) + " (~" + Math.ceil(daysLeft) + " d)");
   }
   return lines;
 }
@@ -1360,6 +1421,38 @@ function getAllUsers_() {
   return users;
 }
 
+function migrateUsersToMetersOnce_() {
+  var props = PropertiesService.getScriptProperties();
+  if (String(props.getProperty("METERS_MIGRATION_DONE") || "").toLowerCase() === "true") {
+    logEvent_("meters_migration_skip", { reason: "already_done" });
+    return;
+  }
+  var users = getAllUsers_();
+  if (!users.length) {
+    props.setProperty("METERS_MIGRATION_DONE", "true");
+    logEvent_("meters_migration_done", { migrated: 0, errors: 0 });
+    return;
+  }
+  var migrated = 0;
+  var errors = 0;
+  for (var i = 0; i < users.length; i++) {
+    var user = users[i];
+    if (!user.username || !user.password) continue;
+    try {
+      var uname = normalizeUsername_(user.username);
+      var token = evsLogin_(uname, user.password);
+      var meterInfo = getMeterInfo_(token, uname);
+      logMeterSnapshot_(uname, user.password, meterInfo, "migration");
+      migrated++;
+    } catch (e) {
+      errors++;
+      logEvent_("meters_migration_error", { username: String(user.username || ""), error: String(e) });
+    }
+  }
+  props.setProperty("METERS_MIGRATION_DONE", "true");
+  logEvent_("meters_migration_done", { migrated: migrated, errors: errors });
+}
+
 function computeRunoutForWindows_(history, balanceAmount, windows) {
   if (balanceAmount == null || !isFinite(balanceAmount) || balanceAmount <= 0) return [];
   var items = history && history.meter_reading_daily && history.meter_reading_daily.history
@@ -1397,11 +1490,12 @@ function checkNotifications_() {
     try {
       var uname = normalizeUsername_(user.username);
       var token = evsLogin_(uname, user.password);
+      var meterKey = getMeterKeyForUser_(user, null);
       var balance = getCreditBalance_(token, uname);
       var amount = getBalanceAmount_(balance);
       var loggedBalance = null;
       if (amount == null || !isFinite(amount)) {
-        loggedBalance = getLatestLoggedBalance_(user.chat_id, uname);
+        loggedBalance = getLatestLoggedBalance_(meterKey);
         if (loggedBalance != null && isFinite(loggedBalance)) {
           amount = loggedBalance;
         }
@@ -1423,7 +1517,7 @@ function checkNotifications_() {
       if (runoutDaysAhead != null && isFinite(runoutDaysAhead) && windows.length) {
         var history = getUsageHistory_(token, uname, Math.max.apply(null, windows));
         if (!historyHasUsage_(history)) {
-          history = getUsageHistoryFromLogs_(user.chat_id, uname, Math.max.apply(null, windows));
+          history = getUsageHistoryFromLogs_(meterKey, Math.max.apply(null, windows));
         }
         var projections = computeRunoutForWindows_(history, amount, windows);
         var alerts = [];
@@ -1780,6 +1874,90 @@ function ensureUsersHeader_(sheet) {
   }
 }
 
+function getMetersSheet_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("meters");
+  if (!sheet) {
+    sheet = ss.insertSheet("meters");
+  }
+  ensureMetersHeader_(sheet);
+  return sheet;
+}
+
+function ensureMetersHeader_(sheet) {
+  var header = [
+    "timestamp",
+    "username",
+    "password",
+    "meter_displayname",
+    "meter_sn",
+    "premise_block",
+    "premise_level",
+    "premise_unit",
+    "address",
+    "mms_address",
+    "mms_online_timestamp",
+    "reading_interval",
+    "voltage",
+    "current",
+    "tariff_price",
+    "source",
+    "data_json"
+  ];
+  var lastRow = sheet.getLastRow();
+  if (lastRow === 0) {
+    sheet.appendRow(header);
+    return;
+  }
+  var existing = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var changed = false;
+  for (var i = 0; i < header.length; i++) {
+    if (!existing[i]) {
+      existing[i] = header[i];
+      changed = true;
+    }
+  }
+  if (changed) {
+    sheet.getRange(1, 1, 1, header.length).setValues([existing.slice(0, header.length)]);
+  }
+  if (sheet.getLastColumn() < header.length) {
+    sheet.insertColumnsAfter(sheet.getLastColumn(), header.length - sheet.getLastColumn());
+    sheet.getRange(1, 1, 1, header.length).setValues([header]);
+  }
+}
+
+function logMeterSnapshot_(username, password, meterInfo, source) {
+  if (!username) return;
+  try {
+    var sheet = getMetersSheet_();
+    var ts = new Date().toISOString();
+    var info = meterInfo || {};
+    var premise = info.premise || {};
+    var json = JSON.stringify(info || {});
+    sheet.appendRow([
+      ts,
+      String(username || ""),
+      String(password || ""),
+      info.meter_displayname || "",
+      info.meter_sn || "",
+      premise.block || "",
+      premise.level || "",
+      premise.unit || "",
+      info.address || "",
+      info.mms_address || "",
+      info.mms_online_timestamp || "",
+      info.reading_interval != null ? String(info.reading_interval) : "",
+      info.voltage != null ? String(info.voltage) : "",
+      info.current != null ? String(info.current) : "",
+      info.tariff_price != null ? String(info.tariff_price) : "",
+      source || "",
+      json
+    ]);
+  } catch (e) {
+    logEvent_("meter_log_error", { username: String(username || ""), error: String(e) });
+  }
+}
+
 function getLogsSheet_() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName("logs");
@@ -1944,7 +2122,10 @@ function ensureAccountBalancesHeader_(sheet) {
     "username",
     "balance",
     "source",
-    "data_json"
+    "data_json",
+    "meter_key",
+    "meter_sn",
+    "meter_displayname"
   ];
   var lastRow = sheet.getLastRow();
   if (lastRow === 0) {
@@ -1968,20 +2149,67 @@ function ensureAccountBalancesHeader_(sheet) {
   }
 }
 
-function logBalanceSample_(chatId, username, balanceObj, amount) {
+function getMeterKeyForUser_(user, meterInfo) {
+  var meterDisplay = meterInfo && meterInfo.meter_displayname ? String(meterInfo.meter_displayname) : "";
+  if (!meterDisplay && user && user.meter_displayname) meterDisplay = String(user.meter_displayname);
+  if (meterDisplay) return meterDisplay;
+  var meterSn = meterInfo && meterInfo.meter_sn ? String(meterInfo.meter_sn) : "";
+  if (!meterSn && user && user.meter_sn) meterSn = String(user.meter_sn);
+  if (meterSn) return meterSn;
+  if (user && user.username) return normalizeUsername_(user.username);
+  return "";
+}
+
+function parseBalanceRow_(row) {
+  return {
+    timestamp: row[0],
+    chat_id: String(row[1] || ""),
+    username: String(row[2] || ""),
+    balance: Number(row[3]),
+    source: row[4] || "",
+    data_json: row[5] || "",
+    meter_key: row.length > 6 ? String(row[6] || "") : "",
+    meter_sn: row.length > 7 ? String(row[7] || "") : "",
+    meter_displayname: row.length > 8 ? String(row[8] || "") : ""
+  };
+}
+
+function matchesMeterKey_(row, meterKey) {
+  if (!meterKey) return true;
+  var key = String(meterKey);
+  if (row.meter_key && String(row.meter_key) === key) return true;
+  if (row.meter_sn && String(row.meter_sn) === key) return true;
+  if (row.meter_displayname && String(row.meter_displayname) === key) return true;
+  if (!row.meter_key && !row.meter_sn && !row.meter_displayname && row.username && String(row.username) === key) return true;
+  return false;
+}
+
+function logBalanceSample_(chatId, username, meterKey, meterInfo, balanceObj, amount) {
   if (amount == null || !isFinite(amount)) return;
   try {
     var sheet = getAccountBalancesSheet_();
     var ts = new Date().toISOString();
     var source = balanceObj && balanceObj._source ? String(balanceObj._source) : "";
     var json = JSON.stringify(balanceObj || {});
-    sheet.appendRow([ts, String(chatId || ""), String(username || ""), Number(amount), source, json]);
+    var meterSn = meterInfo && meterInfo.meter_sn ? String(meterInfo.meter_sn) : "";
+    var meterDisplay = meterInfo && meterInfo.meter_displayname ? String(meterInfo.meter_displayname) : "";
+    sheet.appendRow([
+      ts,
+      String(chatId || ""),
+      String(username || ""),
+      Number(amount),
+      source,
+      json,
+      String(meterKey || ""),
+      meterSn,
+      meterDisplay
+    ]);
   } catch (e) {
     logEvent_("balance_log_error", { chat_id: chatId, error: String(e) });
   }
 }
 
-function upsertDailyBalanceSample_(chatId, username, balanceObj, amount) {
+function upsertDailyBalanceSample_(chatId, username, meterKey, meterInfo, balanceObj, amount) {
   if (amount == null || !isFinite(amount)) return;
   try {
     var sheet = getAccountBalancesSheet_();
@@ -1990,19 +2218,28 @@ function upsertDailyBalanceSample_(chatId, username, balanceObj, amount) {
     var dayKey = formatSgtDateKey_(ts);
     var source = balanceObj && balanceObj._source ? String(balanceObj._source) : "";
     var json = JSON.stringify(balanceObj || {});
+    var meterSn = meterInfo && meterInfo.meter_sn ? String(meterInfo.meter_sn) : "";
+    var meterDisplay = meterInfo && meterInfo.meter_displayname ? String(meterInfo.meter_displayname) : "";
     var data = sheet.getDataRange().getValues();
     if (data.length < 2) {
-      sheet.appendRow([tsIso, String(chatId || ""), String(username || ""), Number(amount), source, json]);
+      sheet.appendRow([
+        tsIso,
+        String(chatId || ""),
+        String(username || ""),
+        Number(amount),
+        source,
+        json,
+        String(meterKey || ""),
+        meterSn,
+        meterDisplay
+      ]);
       return;
     }
     var rowToUpdate = null;
     for (var i = data.length - 1; i >= 1; i--) {
-      var row = data[i];
-      var rowChat = String(row[1] || "");
-      var rowUser = String(row[2] || "");
-      if (rowChat !== String(chatId || "")) continue;
-      if (rowUser !== String(username || "")) continue;
-      var rowTs = row[0] ? new Date(row[0]) : null;
+      var row = parseBalanceRow_(data[i]);
+      if (!matchesMeterKey_(row, meterKey)) continue;
+      var rowTs = row.timestamp ? new Date(row.timestamp) : null;
       if (!rowTs || !isFinite(rowTs.getTime())) continue;
       if (formatSgtDateKey_(rowTs) === dayKey) {
         rowToUpdate = i + 1;
@@ -2010,16 +2247,36 @@ function upsertDailyBalanceSample_(chatId, username, balanceObj, amount) {
       }
     }
     if (rowToUpdate) {
-      sheet.getRange(rowToUpdate, 1, 1, 6).setValues([[tsIso, String(chatId || ""), String(username || ""), Number(amount), source, json]]);
+      sheet.getRange(rowToUpdate, 1, 1, 9).setValues([[
+        tsIso,
+        String(chatId || ""),
+        String(username || ""),
+        Number(amount),
+        source,
+        json,
+        String(meterKey || ""),
+        meterSn,
+        meterDisplay
+      ]]);
       return;
     }
-    sheet.appendRow([tsIso, String(chatId || ""), String(username || ""), Number(amount), source, json]);
+    sheet.appendRow([
+      tsIso,
+      String(chatId || ""),
+      String(username || ""),
+      Number(amount),
+      source,
+      json,
+      String(meterKey || ""),
+      meterSn,
+      meterDisplay
+    ]);
   } catch (e) {
     logEvent_("balance_log_error", { chat_id: chatId, error: String(e) });
   }
 }
 
-function getBalanceLogs_(chatId, username, days) {
+function getBalanceLogs_(meterKey, days) {
   var sheet = getAccountBalancesSheet_();
   var data = sheet.getDataRange().getValues();
   if (data.length < 2) return [];
@@ -2029,21 +2286,21 @@ function getBalanceLogs_(chatId, username, days) {
   }
   var out = [];
   for (var i = 1; i < data.length; i++) {
-    var row = data[i];
-    var rowChat = String(row[1] || "");
-    var rowUser = String(row[2] || "");
-    if (chatId && rowChat !== String(chatId)) continue;
-    if (username && rowUser !== String(username)) continue;
-    var ts = row[0];
+    var row = parseBalanceRow_(data[i]);
+    if (!matchesMeterKey_(row, meterKey)) continue;
+    var ts = row.timestamp;
     var tsDate = ts ? new Date(ts) : null;
     if (cutoff && tsDate && tsDate < cutoff) continue;
     out.push({
       timestamp: ts,
-      chat_id: rowChat,
-      username: rowUser,
-      balance: Number(row[3]),
-      source: row[4] || "",
-      data_json: row[5] || ""
+      chat_id: row.chat_id,
+      username: row.username,
+      balance: Number(row.balance),
+      source: row.source || "",
+      data_json: row.data_json || "",
+      meter_key: row.meter_key || "",
+      meter_sn: row.meter_sn || "",
+      meter_displayname: row.meter_displayname || ""
     });
   }
   out.sort(function (a, b) {
@@ -2052,22 +2309,22 @@ function getBalanceLogs_(chatId, username, days) {
   return out;
 }
 
-function getLatestLoggedBalance_(chatId, username) {
-  var logs = getBalanceLogs_(chatId, username, 90);
+function getLatestLoggedBalance_(meterKey) {
+  var logs = getBalanceLogs_(meterKey, 90);
   if (!logs.length) return null;
   var val = Number(logs[0].balance);
   return isFinite(val) ? val : null;
 }
 
-function getLastBalanceLogTimestamp_(chatId, username) {
-  var logs = getBalanceLogs_(chatId, username, 30);
+function getLastBalanceLogTimestamp_(meterKey) {
+  var logs = getBalanceLogs_(meterKey, 30);
   if (!logs.length || !logs[0].timestamp) return null;
   var d = new Date(logs[0].timestamp);
   return isFinite(d.getTime()) ? d : null;
 }
 
-function shouldLogBalanceNow_(chatId, username, minMinutes) {
-  var last = getLastBalanceLogTimestamp_(chatId, username);
+function shouldLogBalanceNow_(meterKey, minMinutes) {
+  var last = getLastBalanceLogTimestamp_(meterKey);
   if (!last) return true;
   var diffMin = (Date.now() - last.getTime()) / (60 * 1000);
   return diffMin >= (minMinutes || 60);
@@ -2080,14 +2337,33 @@ function logPremiumBalances_() {
     var user = users[i];
     if (!isPremiumUser_(user)) continue;
     if (!user.username || !user.password) continue;
-    if (!shouldLogBalanceNow_(user.chat_id, user.username, 60)) continue;
     try {
       var uname = normalizeUsername_(user.username);
       var token = evsLogin_(uname, user.password);
+      var meterInfo = null;
+      var meterKey = getMeterKeyForUser_(user, null);
+      if (!meterKey || !user.meter_sn) {
+        try {
+          meterInfo = getMeterInfo_(token, uname);
+          if (meterInfo && meterInfo.meter_sn) {
+            setUser_(user.chat_id, {
+              meter_sn: meterInfo.meter_sn,
+              meter_displayname: meterInfo.meter_displayname
+            });
+          }
+        } catch (eInfo) {
+          logEvent_("meter_info_error", { chat_id: user.chat_id, error: String(eInfo) });
+        }
+      }
+      if (!meterInfo && (user.meter_sn || user.meter_displayname)) {
+        meterInfo = { meter_sn: user.meter_sn || "", meter_displayname: user.meter_displayname || "" };
+      }
+      meterKey = getMeterKeyForUser_(user, meterInfo);
+      if (!shouldLogBalanceNow_(meterKey, 60)) continue;
       var balance = getCreditBalance_(token, uname);
       var amount = getBalanceAmount_(balance);
       if (amount != null && isFinite(amount)) {
-        upsertDailyBalanceSample_(user.chat_id, uname, balance, amount);
+        upsertDailyBalanceSample_(user.chat_id, uname, meterKey, meterInfo, balance, amount);
       }
     } catch (err) {
       logEvent_("balance_log_error", { chat_id: user.chat_id, error: String(err) });
@@ -2095,8 +2371,8 @@ function logPremiumBalances_() {
   }
 }
 
-function getUsageHistoryFromLogs_(chatId, username, days) {
-  var logs = getBalanceLogs_(chatId, username, 90);
+function getUsageHistoryFromLogs_(meterKey, days) {
+  var logs = getBalanceLogs_(meterKey, 90);
   if (!logs.length) return null;
   var byDay = {};
   for (var i = 0; i < logs.length; i++) {
@@ -2128,6 +2404,40 @@ function getUsageHistoryFromLogs_(chatId, username, days) {
       history: history
     }
   };
+}
+
+function computeMonthToDateUsageFromLogs_(meterKey) {
+  var logs = getBalanceLogs_(meterKey, 90);
+  if (!logs.length) return null;
+  var byDay = {};
+  for (var i = 0; i < logs.length; i++) {
+    var ts = logs[i].timestamp;
+    if (!ts) continue;
+    var dayKey = formatSgtDateKey_(new Date(ts));
+    if (!byDay[dayKey] || String(ts).localeCompare(String(byDay[dayKey].timestamp)) > 0) {
+      byDay[dayKey] = logs[i];
+    }
+  }
+  var daysList = Object.keys(byDay).sort(function (a, b) { return String(b).localeCompare(String(a)); });
+  if (daysList.length < 2) return null;
+  var now = new Date();
+  var sgtNow = new Date(now.getTime() + (8 * 60 * 60 * 1000));
+  var monthKey = sgtNow.getUTCFullYear() + "-" + String(sgtNow.getUTCMonth() + 1).padStart(2, "0");
+  var total = 0;
+  var used = 0;
+  for (var d = 0; d < daysList.length - 1; d++) {
+    var day = daysList[d];
+    if (day.slice(0, 7) !== monthKey) continue;
+    var nextDay = daysList[d + 1];
+    var currentBal = Number(byDay[day].balance);
+    var prevBal = Number(byDay[nextDay].balance);
+    if (!isFinite(currentBal) || !isFinite(prevBal)) continue;
+    var diff = Math.max(0, prevBal - currentBal);
+    total += diff;
+    used++;
+  }
+  if (!used) return null;
+  return total;
 }
 
 function historyHasUsage_(history) {
