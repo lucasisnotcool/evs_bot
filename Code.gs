@@ -739,7 +739,7 @@ function handleMyInfo_(chatId, user) {
     if (meterInfo && meterInfo.current != null) lines.push("Current: " + meterInfo.current);
     if (meterInfo && meterInfo.tariff_price != null) lines.push("Tariff price: " + meterInfo.tariff_price);
     if (balance && balance.tariff_timestamp) lines.push("Tariff timestamp: " + balance.tariff_timestamp);
-    lines.push("Top up / portal: https://nus-utown.evs.com.sg/EVSWebPOS/");
+    lines.push('Top up / portal: <a href="https://cp2nus.evs.com.sg/">EVS WebPOS</a>');
 
     if (!lines.length) {
       lines.push("No meter info available.");
